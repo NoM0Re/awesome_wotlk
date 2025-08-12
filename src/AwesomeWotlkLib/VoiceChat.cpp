@@ -9,9 +9,49 @@
 #include <vector>
 #include <string>
 
-CVar* s_cvar_voiceID = nullptr;
-CVar* s_cvar_speed = nullptr;
-CVar* s_cvar_volume = nullptr;
+static Console::CVar* s_cvar_voiceID;
+static Console::CVar* s_cvar_speed;
+static Console::CVar* s_cvar_volume;
+
+#include <windows.h>
+#include <string>
+
+std::string WideStringToUtf8(const std::wstring& wstr)
+{
+    if (wstr.empty())
+        return std::string();
+    int sizeNeeded = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        wstr.c_str(),
+        -1, // bis Nullterminator
+        nullptr,
+        0,
+        nullptr,
+        nullptr
+    );
+    std::string result(sizeNeeded - 1, '\0');
+    WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        wstr.c_str(),
+        -1,
+        &result[0],
+        sizeNeeded - 1,
+        nullptr,
+        nullptr
+    );
+    return result;
+}
+
+std::wstring Utf8ToWide(const char* utf8Str)
+{
+    if (!utf8Str) return L"";
+    int size = MultiByteToWideChar(CP_UTF8, 0, utf8Str, -1, nullptr, 0);
+    std::wstring wide(size - 1, 0); // -1 weil Nullterminator nicht gezählt werden soll
+    MultiByteToWideChar(CP_UTF8, 0, utf8Str, -1, &wide[0], size);
+    return wide;
+}
 
 struct VoiceTtsVoiceType {
     int voiceID;
@@ -122,10 +162,14 @@ static int Lua_VoiceChat_GetTtsVoices(lua_State* L)
     for (const auto& voice : voices)
     {
         lua_newtable(L);
-        lua_pushstring(L, "voiceID"); lua_pushinteger(L, voice.voiceID); lua_settable(L, -3);
-        lua_pushstring(L, "name");
-        std::string nameUtf8 = std::wstring_convert<std::codecvt_utf8<wchar_t>>().to_bytes(voice.name);
-        lua_pushstring(L, nameUtf8.c_str()); lua_settable(L, -3);
+
+        lua_pushnumber(L, voice.voiceID);
+        lua_setfield(L, -2, "voiceID");
+
+        std::string nameUtf8 = WideStringToUtf8(voice.name);
+        lua_pushstring(L, nameUtf8.c_str());
+        lua_setfield(L, -2, "name");
+
         lua_rawseti(L, -2, i++);
     }
     return 1;
@@ -133,61 +177,74 @@ static int Lua_VoiceChat_GetTtsVoices(lua_State* L)
 
 static int Lua_VoiceChat_GetRemoteTtsVoices(lua_State* L)
 {
-    auto voices = VoiceChat_GetRemoteTtsVoices();
+    auto voices = VoiceChat_GetTtsVoices();
     lua_createtable(L, 0, 0);
 
     int i = 1;
     for (const auto& voice : voices)
     {
         lua_newtable(L);
-        lua_pushstring(L, "voiceID"); lua_pushinteger(L, voice.voiceID); lua_settable(L, -3);
-        lua_pushstring(L, "name");
-        std::string nameUtf8 = std::wstring_convert<std::codecvt_utf8<wchar_t>>().to_bytes(voice.name);
-        lua_pushstring(L, nameUtf8.c_str()); lua_settable(L, -3);
+
+        lua_pushnumber(L, voice.voiceID);
+        lua_setfield(L, -2, "voiceID");
+
+        std::string nameUtf8 = WideStringToUtf8(voice.name);
+        lua_pushstring(L, nameUtf8.c_str());
+        lua_setfield(L, -2, "name");
+
         lua_rawseti(L, -2, i++);
     }
     return 1;
 }
 
-int OnVoiceIDChanged(CVar* cvar, const char* newVal)
+static int OnVoiceIDChanged(Console::CVar* cvar, const char* prevVal, const char* newVal, void* udata)
 {
     int val = atoi(newVal);
     if (val < 0) val = 0;
     std::string valStr = std::to_string(val);
     SetCVarValue(cvar, valStr.c_str(), 0, 0, 0, 0);
-    return 0;
+    return 1;
 }
 
-int OnSpeedChanged(CVar* cvar, const char* newVal)
+static int OnSpeedChanged(Console::CVar* cvar, const char* prevVal, const char* newVal, void* udata)
 {
     int val = atoi(newVal);
     if (val < -10) val = -10;
     else if (val > 10) val = 10;
     std::string valStr = std::to_string(val);
     SetCVarValue(cvar, valStr.c_str(), 0, 0, 0, 0);
-    return 0;
+    return 1;
 }
 
-int OnVolumeChanged(CVar* cvar, const char* newVal)
+static int OnVolumeChanged(Console::CVar* cvar, const char* prevVal, const char* newVal, void* udata)
 {
     int val = atoi(newVal);
     if (val < 0) val = 0;
     else if (val > 100) val = 100;
     std::string valStr = std::to_string(val);
     SetCVarValue(cvar, valStr.c_str(), 0, 0, 0, 0);
-    return 0;
+    return 1;
 }
 
 static int Lua_VoiceChat_SpeakText(lua_State* L)
 {
-    int voiceID = luaL_checkinteger(L, 1);
-    const char* text = luaL_checkstring(L, 2);
-    const char* destination = luaL_optstring(L, 3, "default");
-    int rate = luaL_optinteger(L, 4, 0);
-    int volume = luaL_optinteger(L, 5, 100);
+    int voiceID = (int)luaL_checknumber(L, 1);
+    const char* text = luaL_checklstring(L, 2, nullptr);
 
-    std::wstring wText = std::wstring_convert<std::codecvt_utf8<wchar_t>>().from_bytes(text);
-    std::wstring wDest = std::wstring_convert<std::codecvt_utf8<wchar_t>>().from_bytes(destination);
+    const char* destination = "default";
+    if (lua_gettop(L) >= 3 && lua_type(L, 3) != LUA_TNIL)
+        destination = luaL_checklstring(L, 3, nullptr);
+
+    int rate = 0;
+    if (lua_gettop(L) >= 4 && lua_type(L, 4) != LUA_TNIL)
+        rate = (int)luaL_checknumber(L, 4);
+
+    int volume = 100;
+    if (lua_gettop(L) >= 5 && lua_type(L, 5) != LUA_TNIL)
+        volume = (int)luaL_checknumber(L, 5);
+
+    std::wstring wText = Utf8ToWide(text);
+    std::wstring wDest = Utf8ToWide(destination);
 
     VoiceChat_SpeakText(voiceID, wText, wDest, rate, volume);
     return 0;
@@ -204,9 +261,9 @@ void VoiceChat_SpeakText(const std::wstring& text)
 
 void RegisterVoiceChatCVars()
 {
-    s_cvar_voiceID = RegisterCVar("tts_voiceID", "Voice ID for TTS", 1, "0", OnVoiceIDChanged, 0, 0, 0, 0);
-    s_cvar_speed   = RegisterCVar("tts_speed", "Speech-rate for TTS", 1, "0", OnSpeedChanged, 0, 0, 0, 0);
-    s_cvar_volume  = RegisterCVar("tts_volume", "Volume for TTS", 1, "100", OnVolumeChanged, 0, 0, 0, 0);
+    Hooks::FrameXML::registerCVar(&s_cvar_voiceID, "tts_voiceID", NULL, (Console::CVarFlags)1, "0", OnVoiceIDChanged);
+    Hooks::FrameXML::registerCVar(&s_cvar_speed, "tts_speed", NULL, (Console::CVarFlags)1, "0", OnSpeedChanged);
+    Hooks::FrameXML::registerCVar(&s_cvar_volume, "tts_volume", NULL, (Console::CVarFlags)1, "100", OnVolumeChanged);
 }
 
 static int lua_openlibvoicechat(lua_State* L)
