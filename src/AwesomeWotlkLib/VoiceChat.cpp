@@ -1,4 +1,3 @@
-#ifdef _WIN32
 #include "VoiceChat.h"
 #include "GameClient.h"
 #include "Hooks.h"
@@ -13,7 +12,7 @@ static Console::CVar* s_cvar_voiceID;
 static Console::CVar* s_cvar_speed;
 static Console::CVar* s_cvar_volume;
 
-#include <windows.h>
+#include <Windows.h>
 #include <string>
 
 std::string WideStringToUtf8(const std::wstring& wstr)
@@ -287,21 +286,9 @@ static int lua_openlibvoicechat(lua_State* L)
 // Initialization
 // ====================
 
-namespace VoiceChat {
-    void initialize()
-    {
-        VoiceChat_InitCOM();
-        Hooks::FrameXML::registerLuaLib(lua_openlibvoicechat);
-        RegisterVoiceChatCVars();
-    }
+void VoiceChat::initialize()
+{
+    VoiceChat_InitCOM();
+    Hooks::FrameXML::registerLuaLib(lua_openlibvoicechat);
+    RegisterVoiceChatCVars();
 }
-
-#else // ifndef _WIN32
-
-namespace VoiceChat {
-    void initialize() {
-        // No implementation for non-Windows platforms
-    }
-}
-
-#endif
