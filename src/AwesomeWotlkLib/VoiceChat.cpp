@@ -7,13 +7,11 @@
 #include <locale>
 #include <vector>
 #include <string>
+#include <Windows.h>
 
 static Console::CVar* s_cvar_voiceID;
 static Console::CVar* s_cvar_speed;
 static Console::CVar* s_cvar_volume;
-
-#include <Windows.h>
-#include <string>
 
 std::string WideStringToUtf8(const std::wstring& wstr)
 {
@@ -29,6 +27,9 @@ std::string WideStringToUtf8(const std::wstring& wstr)
         nullptr,
         nullptr
     );
+    if (sizeNeeded == 0) {
+        return std::string();
+    }
     std::string result(sizeNeeded - 1, '\0');
     WideCharToMultiByte(
         CP_UTF8,
@@ -47,6 +48,7 @@ std::wstring Utf8ToWide(const char* utf8Str)
 {
     if (!utf8Str) return L"";
     int size = MultiByteToWideChar(CP_UTF8, 0, utf8Str, -1, nullptr, 0);
+    if (size == 0) return L""; // Conversion failed
     std::wstring wide(size - 1, 0); // -1 weil Nullterminator nicht gezählt werden soll
     MultiByteToWideChar(CP_UTF8, 0, utf8Str, -1, &wide[0], size);
     return wide;
@@ -110,9 +112,11 @@ static std::vector<VoiceTtsVoiceType> VoiceChat_GetRemoteTtsVoices()
     return VoiceChat_GetTtsVoices();
 }
 
-static void VoiceChat_SpeakText(int voiceID, const std::wstring& text, const std::wstring& /*destination*/, int rate = 0, int volume = 100)
+// 'destination' parameter is reserved for future use (e.g., remote TTS output)
+static void VoiceChat_SpeakText(int voiceID, const std::wstring& text, const std::wstring& destination, int rate = 0, int volume = 100)
 {
     VoiceChat_InitCOM();
+    (void)destination; // Suppress unused parameter warning
 
     ISpVoice* pVoice = nullptr;
     HRESULT hr = CoCreateInstance(CLSID_SpVoice, NULL, CLSCTX_ALL, IID_ISpVoice, (void**)&pVoice);
@@ -143,7 +147,7 @@ static void VoiceChat_SpeakText(int voiceID, const std::wstring& text, const std
 
     pVoice->SetRate(rate);
     pVoice->SetVolume(volume);
-    pVoice->Speak(text.c_str(), SPF_ASYNC | SPF_IS_XML, NULL); // SPF_ASYNC = running parralel
+    pVoice->Speak(text.c_str(), SPF_DEFAULT, NULL);
 
     pVoice->Release();
 }
@@ -274,10 +278,12 @@ static int lua_openlibvoicechat(lua_State* L)
     };
 
     lua_createtable(L, 0, std::size(methods));
+
     for (size_t i = 0; i < std::size(methods); i++) {
         lua_pushcfunction(L, methods[i].func);
         lua_setfield(L, -2, methods[i].name);
     }
+
     lua_setglobal(L, "C_VoiceChat");
     return 0;
 }

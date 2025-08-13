@@ -7,6 +7,7 @@
 #include "UnitAPI.h"
 #include <Windows.h>
 #include <Detours/detours.h>
+#include "VoiceChat.h"
 
 
 static int lua_debugbreak(lua_State* L)
@@ -50,6 +51,7 @@ static void OnAttach()
     NamePlates::initialize();
     Misc::initialize();
     UnitAPI::initialize();
+    VoiceChat::initialize();
     DetourTransactionCommit();
 
     // Register base
