@@ -13,33 +13,24 @@ static Console::CVar* s_cvar_voiceID;
 static Console::CVar* s_cvar_speed;
 static Console::CVar* s_cvar_volume;
 
+// Globale SAPI-Voice-Instanz
+static ISpVoice* g_pVoice = nullptr;
+
 std::string WideStringToUtf8(const std::wstring& wstr)
 {
     if (wstr.empty())
         return std::string();
     int sizeNeeded = WideCharToMultiByte(
-        CP_UTF8,
-        0,
-        wstr.c_str(),
-        -1, // bis Nullterminator
-        nullptr,
-        0,
-        nullptr,
-        nullptr
+        CP_UTF8, 0, wstr.c_str(), -1,
+        nullptr, 0, nullptr, nullptr
     );
     if (sizeNeeded == 0) {
         return std::string();
     }
     std::string result(sizeNeeded - 1, '\0');
     WideCharToMultiByte(
-        CP_UTF8,
-        0,
-        wstr.c_str(),
-        -1,
-        &result[0],
-        sizeNeeded - 1,
-        nullptr,
-        nullptr
+        CP_UTF8, 0, wstr.c_str(), -1,
+        &result[0], sizeNeeded - 1, nullptr, nullptr
     );
     return result;
 }
@@ -48,8 +39,8 @@ std::wstring Utf8ToWide(const char* utf8Str)
 {
     if (!utf8Str) return L"";
     int size = MultiByteToWideChar(CP_UTF8, 0, utf8Str, -1, nullptr, 0);
-    if (size == 0) return L""; // Conversion failed
-    std::wstring wide(size - 1, 0); // -1 weil Nullterminator nicht gezählt werden soll
+    if (size == 0) return L"";
+    std::wstring wide(size - 1, 0);
     MultiByteToWideChar(CP_UTF8, 0, utf8Str, -1, &wide[0], size);
     return wide;
 }
@@ -60,7 +51,7 @@ struct VoiceTtsVoiceType {
 };
 
 // ====================
-// COM Init (only once)
+// COM / Voice Init (only once)
 // ====================
 static void VoiceChat_InitCOM()
 {
@@ -69,6 +60,17 @@ static void VoiceChat_InitCOM()
         HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
         if (SUCCEEDED(hr)) {
             comInitDone = true;
+        }
+    }
+}
+
+static void VoiceChat_InitVoice()
+{
+    if (!g_pVoice) {
+        VoiceChat_InitCOM();
+        HRESULT hr = CoCreateInstance(CLSID_SpVoice, NULL, CLSCTX_ALL, IID_ISpVoice, (void**)&g_pVoice);
+        if (FAILED(hr)) {
+            g_pVoice = nullptr;
         }
     }
 }
@@ -115,17 +117,14 @@ static std::vector<VoiceTtsVoiceType> VoiceChat_GetRemoteTtsVoices()
 // 'destination' parameter is reserved for future use (e.g., remote TTS output)
 static void VoiceChat_SpeakText(int voiceID, const std::wstring& text, const std::wstring& destination, int rate = 0, int volume = 100)
 {
-    VoiceChat_InitCOM();
+    VoiceChat_InitVoice();
     (void)destination; // Suppress unused parameter warning
+    if (!g_pVoice) return;
 
-    ISpVoice* pVoice = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_SpVoice, NULL, CLSCTX_ALL, IID_ISpVoice, (void**)&pVoice);
-    if (FAILED(hr) || !pVoice)
-        return;
-
+    // Stimme setzen (falls vorhanden)
     IEnumSpObjectTokens* pEnum = nullptr;
     ULONG count = 0;
-    hr = SpEnumTokens(SPCAT_VOICES, NULL, NULL, &pEnum);
+    HRESULT hr = SpEnumTokens(SPCAT_VOICES, NULL, NULL, &pEnum);
 
     if (SUCCEEDED(hr) && pEnum)
     {
@@ -135,7 +134,7 @@ static void VoiceChat_SpeakText(int voiceID, const std::wstring& text, const std
         {
             if (index == static_cast<ULONG>(voiceID))
             {
-                pVoice->SetVoice(pToken);
+                g_pVoice->SetVoice(pToken);
                 pToken->Release();
                 break;
             }
@@ -145,11 +144,10 @@ static void VoiceChat_SpeakText(int voiceID, const std::wstring& text, const std
         pEnum->Release();
     }
 
-    pVoice->SetRate(rate);
-    pVoice->SetVolume(volume);
-    pVoice->Speak(text.c_str(), SPF_DEFAULT, NULL);
-
-    pVoice->Release();
+    g_pVoice->SetRate(rate);
+    g_pVoice->SetVolume(volume);
+    // ASYNC → kein Freeze, g_pVoice bleibt erhalten
+    g_pVoice->Speak(text.c_str(), SPF_ASYNC, NULL);
 }
 
 // ====================
@@ -294,7 +292,7 @@ static int lua_openlibvoicechat(lua_State* L)
 
 void VoiceChat::initialize()
 {
-    VoiceChat_InitCOM();
+    VoiceChat_InitVoice(); // erstellt g_pVoice einmalig
     Hooks::FrameXML::registerLuaLib(lua_openlibvoicechat);
     RegisterVoiceChatCVars();
 }
