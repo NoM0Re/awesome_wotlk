@@ -15,9 +15,14 @@ target_include_directories(
 target_link_libraries(
 	${PROJECT_NAME} PRIVATE
 		Detours
+        	ole32
+        	oleaut32
+        	uuid
+        	sapi
 )
 
 target_compile_definitions(
 	${PROJECT_NAME} PRIVATE
 		APP_NAME="${PROJECT_NAME}"
 )
+
