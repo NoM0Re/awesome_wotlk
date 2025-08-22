@@ -23,12 +23,23 @@
 //        - SetVoiceOptionByName(voiceName)
 //        - RefreshVoices()               -> fires VOICE_CHAT_TTS_VOICES_UPDATE if list changed
 //
+// Events:
+//   VOICE_CHAT_TTS_PLAYBACK_STARTED (numConsumers:number, utteranceID:number, durationMS:number, destination:number)
+//       - Fired when SAPI starts the utterance. durationMS is always 0.
+//   VOICE_CHAT_TTS_PLAYBACK_FINISHED (numConsumers:number, utteranceID:number, destination:number)
+//       - Fired when SAPI finishes the utterance.
+//   VOICE_CHAT_TTS_PLAYBACK_FAILED (status:string, utteranceID:number, destination:number)
+//       - Fired if Speak() or setup fails (e.g. no voice/device).
+//   VOICE_CHAT_TTS_SPEAK_TEXT_UPDATE (status:string, utteranceID:number)
+//       - unused.
+//   VOICE_CHAT_TTS_VOICES_UPDATE ()
+//       - Fired when the enumerated voice list changes.
+//
 // Notes:
-// * Uses CVars: ttsVoice, ttsSpeed, ttsVolume (with clamping callbacks)
-// * SAPI speech is async; we map stream numbers to utterance metadata and fire
-//   VOICE_CHAT_TTS_* events on start/finish/failure.
-// * A single global ISpVoice instance is used.
+// * Uses CVars: ttsVoice, ttsSpeed, ttsVolume (with clamping callbacks).
+// * SAPI speech is async; stream numbers are mapped to utterance metadata.
 // * durationMS in START event is always 0 (Blizzard-like behavior).
+// * A single global ISpVoice instance is used.
 // ============================================================================
 
 #include "VoiceChat.h"
@@ -740,7 +751,7 @@ void VoiceChat::initialize()
     Hooks::FrameXML::registerEvent(VOICE_CHAT_TTS_PLAYBACK_FAILED);
     Hooks::FrameXML::registerEvent(VOICE_CHAT_TTS_PLAYBACK_FINISHED);
     Hooks::FrameXML::registerEvent(VOICE_CHAT_TTS_PLAYBACK_STARTED);
-    Hooks::FrameXML::registerEvent(VOICE_CHAT_TTS_SPEAK_TEXT_UPDATE); // kept for compatibility (unused)
+    Hooks::FrameXML::registerEvent(VOICE_CHAT_TTS_SPEAK_TEXT_UPDATE); // unused
     Hooks::FrameXML::registerEvent(VOICE_CHAT_TTS_VOICES_UPDATE);
 
     VoiceChat_RefreshVoices(); // fill cache and fire VOICES_UPDATE at startup
