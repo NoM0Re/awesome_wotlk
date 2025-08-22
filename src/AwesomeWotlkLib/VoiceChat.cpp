@@ -6,9 +6,9 @@
 //        - GetTtsVoices()                -> { {voiceID=..., name="..."}, ... }
 //        - GetRemoteTtsVoices()          -> same as GetTtsVoices()
 //        - SpeakText(voiceID, text[, destination, rate, volume])
-//            destination:
-//              1 or "LocalPlayback"         -> speak immediately
-//              4 or "QueuedLocalPlayback"   -> enqueue; plays when idle
+//            destination (number):
+//              1 -> speak immediately (no special handling; SAPI queues FIFO)
+//              4 -> accepted but not specially handled (also just Speak async)
 //        - StopSpeakingText()            -> stops all queued/playing utterances
 //
 //   2) C_TTSSettings
@@ -28,6 +28,7 @@
 // * SAPI speech is async; we map stream numbers to utterance metadata and fire
 //   VOICE_CHAT_TTS_* events on start/finish/failure.
 // * A single global ISpVoice instance is used.
+// * durationMS in START event is always 0 (Blizzard-like behavior).
 // ============================================================================
 
 #include "VoiceChat.h"
@@ -45,7 +46,6 @@
 #include <mutex>
 #include <unordered_map>
 #include <algorithm>
-#include <deque>
 
 // ============================================================================
 // Event Names (FrameScript::FireEvent payloads)
@@ -53,7 +53,7 @@
 #define VOICE_CHAT_TTS_PLAYBACK_FAILED   "VOICE_CHAT_TTS_PLAYBACK_FAILED"   // status, utteranceID, destination
 #define VOICE_CHAT_TTS_PLAYBACK_FINISHED "VOICE_CHAT_TTS_PLAYBACK_FINISHED" // numConsumers, utteranceID, destination
 #define VOICE_CHAT_TTS_PLAYBACK_STARTED  "VOICE_CHAT_TTS_PLAYBACK_STARTED"  // numConsumers, utteranceID, durationMS, destination
-#define VOICE_CHAT_TTS_SPEAK_TEXT_UPDATE "VOICE_CHAT_TTS_SPEAK_TEXT_UPDATE" // status, utteranceID
+#define VOICE_CHAT_TTS_SPEAK_TEXT_UPDATE "VOICE_CHAT_TTS_SPEAK_TEXT_UPDATE" // status, utteranceID (not used here)
 #define VOICE_CHAT_TTS_VOICES_UPDATE     "VOICE_CHAT_TTS_VOICES_UPDATE"
 
 // ============================================================================
@@ -64,12 +64,16 @@ static std::vector<VoiceTtsVoiceType> VoiceChat_GetTtsVoices();
 static void VoiceChat_InitVoice();
 
 // ============================================================================
-// Destination constants
+// Destination constants (kept for API compatibility; no special handling)
 // ============================================================================
 enum : int {
-    DEST_LOCAL_PLAYBACK         = 1,
-    DEST_QUEUED_LOCAL_PLAYBACK  = 4,
+    DEST_LOCAL_PLAYBACK        = 1,
+    DEST_QUEUED_LOCAL_PLAYBACK = 4,
 };
+
+static int ClampDestination(int d) {
+    return (d == DEST_QUEUED_LOCAL_PLAYBACK) ? DEST_QUEUED_LOCAL_PLAYBACK : DEST_LOCAL_PLAYBACK;
+}
 
 // ============================================================================
 // CVar Helpers
@@ -111,7 +115,8 @@ static ISpVoice* g_pVoice = nullptr;
 // streamNum -> (utteranceID, destination)
 struct UtteranceMeta {
     int id;
-    std::wstring destination;
+    int destination;           // kept to echo in events
+    bool startedEmitted = false;
 };
 static std::mutex g_streamMx;
 static std::unordered_map<ULONG, UtteranceMeta> g_streamMap;
@@ -165,6 +170,72 @@ static bool iequals(const std::wstring& a, const std::wstring& b)
 }
 
 // ============================================================================
+// Lua event helpers (typed, NULL-safe, id-safe)
+// ============================================================================
+
+static inline lua_State* TryGetLua() {
+    return GetLuaState(); // may be null during very early startup
+}
+
+static inline int GetEvtIdOrNeg1(const char* evt) {
+    return FrameScript::GetEventIdByName(evt); // -1 if not registered yet
+}
+
+static inline void FireEvent_NoArgs(const char* evt)
+{
+    lua_State* L = TryGetLua();
+    int id = GetEvtIdOrNeg1(evt);
+    if (!L || id < 0) return;
+
+    lua_pushstring(L, evt);
+    FrameScript::FireEvent_inner(id, L, 1);
+    lua_pop(L, 1);
+}
+
+static inline void FireEvent_TTS_PlaybackFailed(const char* status, int utteranceID, int dest)
+{
+    lua_State* L = TryGetLua();
+    int id = GetEvtIdOrNeg1(VOICE_CHAT_TTS_PLAYBACK_FAILED);
+    if (!L || id < 0) return;
+
+    lua_pushstring(L, VOICE_CHAT_TTS_PLAYBACK_FAILED);
+    lua_pushstring(L, status);
+    lua_pushnumber(L, utteranceID);
+    lua_pushnumber(L, dest); // number
+    FrameScript::FireEvent_inner(id, L, 4);
+    lua_pop(L, 4);
+}
+
+static inline void FireEvent_TTS_PlaybackStarted(int numConsumers, int utteranceID, int durationMS, int dest)
+{
+    lua_State* L = TryGetLua();
+    int id = GetEvtIdOrNeg1(VOICE_CHAT_TTS_PLAYBACK_STARTED);
+    if (!L || id < 0) return;
+
+    lua_pushstring(L, VOICE_CHAT_TTS_PLAYBACK_STARTED);
+    lua_pushnumber(L, numConsumers);
+    lua_pushnumber(L, utteranceID);
+    lua_pushnumber(L, durationMS);
+    lua_pushnumber(L, dest); // number
+    FrameScript::FireEvent_inner(id, L, 5);
+    lua_pop(L, 5);
+}
+
+static inline void FireEvent_TTS_PlaybackFinished(int numConsumers, int utteranceID, int dest)
+{
+    lua_State* L = TryGetLua();
+    int id = GetEvtIdOrNeg1(VOICE_CHAT_TTS_PLAYBACK_FINISHED);
+    if (!L || id < 0) return;
+
+    lua_pushstring(L, VOICE_CHAT_TTS_PLAYBACK_FINISHED);
+    lua_pushnumber(L, numConsumers);
+    lua_pushnumber(L, utteranceID);
+    lua_pushnumber(L, dest); // number
+    FrameScript::FireEvent_inner(id, L, 4);
+    lua_pop(L, 4);
+}
+
+// ============================================================================
 // COM / SAPI Initialization & Event Pump (one-time setup)
 // ============================================================================
 static void VoiceChat_InitCOM()
@@ -179,30 +250,9 @@ static void VoiceChat_InitCOM()
 }
 
 // ============================================================================
-// Queue for destination 4 (QueuedLocalPlayback)
+// SAPI helpers
 // ============================================================================
-struct QueuedItem {
-    int voiceID;
-    std::wstring text;
-    std::wstring destination; // "1"/"4" or readable alias
-    int rate;
-    int volume;
-    int utteranceID;
-};
-
-static std::mutex g_queueMx;
-static std::deque<QueuedItem> g_queue;
-
-static bool VoiceChat_IsBusy()
-{
-    if (!g_pVoice) return false;
-    SPVOICESTATUS st = {};
-    if (FAILED(g_pVoice->GetStatus(&st, nullptr))) return false;
-    return st.dwRunningState != SPRS_DONE;
-}
-
-// Start speaking immediately; returns true on success and gives a stream number
-static bool VoiceChat_StartSpeakNow(const QueuedItem& qi, ULONG* outStreamNum /*nullable*/)
+static bool VoiceChat_StartSpeakNow(int voiceID, const std::wstring& text, int rate, int volume, ULONG* outStreamNum /*nullable*/)
 {
     // Select voice by index
     IEnumSpObjectTokens* pEnum = nullptr; ULONG count = 0;
@@ -211,7 +261,7 @@ static bool VoiceChat_StartSpeakNow(const QueuedItem& qi, ULONG* outStreamNum /*
     if (SUCCEEDED(hr) && pEnum) {
         ISpObjectToken* pToken = nullptr; ULONG index = 0;
         while (pEnum->Next(1, &pToken, &count) == S_OK && count) {
-            if (index == static_cast<ULONG>(qi.voiceID)) {
+            if (index == static_cast<ULONG>(voiceID)) {
                 if (SUCCEEDED(g_pVoice->SetVoice(pToken))) voiceSet = true;
                 pToken->Release();
                 break;
@@ -223,54 +273,17 @@ static bool VoiceChat_StartSpeakNow(const QueuedItem& qi, ULONG* outStreamNum /*
     if (!voiceSet) return false;
 
     // Clamp and apply params
-    int rate   = std::clamp(qi.rate,   -10, 10);
-    int volume = std::clamp(qi.volume,   0, 100);
+    rate   = std::clamp(rate,   -10, 10);
+    volume = std::clamp(volume,   0, 100);
     g_pVoice->SetRate(rate);
     g_pVoice->SetVolume(volume);
 
     ULONG streamNum = 0;
-    HRESULT speakResult = g_pVoice->Speak(qi.text.c_str(), SPF_ASYNC, &streamNum);
+    HRESULT speakResult = g_pVoice->Speak(text.c_str(), SPF_ASYNC, &streamNum);
     if (FAILED(speakResult)) return false;
 
     if (outStreamNum) *outStreamNum = streamNum;
     return true;
-}
-
-// If idle and queue has items, start next queued utterance
-static void VoiceChat_MaybeStartNextQueued()
-{
-    if (VoiceChat_IsBusy()) return;
-
-    QueuedItem next;
-    {
-        std::lock_guard<std::mutex> lock(g_queueMx);
-        if (g_queue.empty()) return;
-        next = g_queue.front();
-        g_queue.pop_front();
-    }
-
-    ULONG streamNum = 0;
-    if (!VoiceChat_StartSpeakNow(next, &streamNum)) {
-        std::string idStr   = std::to_string(next.utteranceID);
-        std::string destStr = WideStringToUtf8(next.destination);
-        FrameScript::FireEvent(VOICE_CHAT_TTS_PLAYBACK_FAILED, "InternalError", idStr.c_str(), destStr.c_str());
-        // Try to continue with any remaining queued item
-        VoiceChat_MaybeStartNextQueued();
-        return;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_streamMx);
-        g_streamMap[streamNum] = UtteranceMeta{ next.utteranceID, next.destination };
-    }
-
-    FrameScript::FireEvent(
-        VOICE_CHAT_TTS_PLAYBACK_STARTED,
-        "1",
-        std::to_string(next.utteranceID).c_str(),
-        "0",
-        WideStringToUtf8(next.destination).c_str()
-    );
 }
 
 // SAPI notifies via a callback "ping"; actual events are drained via GetEvents.
@@ -283,32 +296,34 @@ static void __stdcall OnSpeechNotify(WPARAM /*wParam*/, LPARAM /*lParam*/)
 
     while (SUCCEEDED(g_pVoice->GetEvents(1, &ev, &fetched)) && fetched == 1)
     {
-        if (ev.eEventId == SPEI_END_INPUT_STREAM)
+        switch (ev.eEventId)
         {
-            UtteranceMeta meta{0, L"default"};
+            case SPEI_START_INPUT_STREAM:
             {
                 std::lock_guard<std::mutex> lock(g_streamMx);
                 auto it = g_streamMap.find(ev.ulStreamNum);
-                if (it != g_streamMap.end()) {
-                    meta = it->second;
-                    g_streamMap.erase(it);
+                if (it != g_streamMap.end() && !it->second.startedEmitted) {
+                    UtteranceMeta& meta = it->second;
+                    FireEvent_TTS_PlaybackStarted(1, meta.id, /*durationMS*/0, meta.destination);
+                    meta.startedEmitted = true;
                 }
+                break;
             }
-
-            std::string idStr   = std::to_string(meta.id);
-            std::string destStr = WideStringToUtf8(meta.destination);
-
-            FrameScript::FireEvent(
-                VOICE_CHAT_TTS_PLAYBACK_FINISHED,
-                "1",                // numConsumers (local only)
-                idStr.c_str(),
-                destStr.c_str()
-            );
-
-            // After finishing any stream, attempt to start the next queued item
-            VoiceChat_MaybeStartNextQueued();
+            case SPEI_END_INPUT_STREAM:
+            {
+                UtteranceMeta meta{0, DEST_LOCAL_PLAYBACK};
+                {
+                    std::lock_guard<std::mutex> lock(g_streamMx);
+                    auto it = g_streamMap.find(ev.ulStreamNum);
+                    if (it != g_streamMap.end()) {
+                        meta = it->second;
+                        g_streamMap.erase(it);
+                    }
+                }
+                FireEvent_TTS_PlaybackFinished(1, meta.id, meta.destination);
+                break;
+            }
         }
-
         ::SpClearEvent(&ev);
     }
 }
@@ -321,10 +336,12 @@ void VoiceChat_InitVoice()
         if (SUCCEEDED(hr)) {
             // Register the notify callback once; events will be polled via GetEvents.
             g_pVoice->SetNotifyCallbackFunction(OnSpeechNotify, 0, 0);
-            g_pVoice->SetInterest(
-                SPFEI(SPEI_END_INPUT_STREAM),    // we currently care about FINISHED
-                SPFEI(SPEI_END_INPUT_STREAM)
-            );
+
+            ULONGLONG interest =
+                SPFEI(SPEI_START_INPUT_STREAM) |
+                SPFEI(SPEI_END_INPUT_STREAM);
+
+            g_pVoice->SetInterest(interest, interest);
         }
     }
 }
@@ -388,7 +405,7 @@ static void VoiceChat_RefreshVoices()
     g_cachedVoices = std::move(newVoices);
 
     if (changed) {
-        FrameScript::FireEvent(VOICE_CHAT_TTS_VOICES_UPDATE, "");
+        FireEvent_NoArgs(VOICE_CHAT_TTS_VOICES_UPDATE);
     }
 }
 
@@ -397,7 +414,7 @@ static void VoiceChat_StopAll()
     VoiceChat_InitVoice();
     if (!g_pVoice) return;
 
-    // Stop and purge all queued/ongoing speech
+    // Stop and purge all queued/ongoing speech in SAPI
     g_pVoice->Speak(nullptr, SPF_PURGEBEFORESPEAK, nullptr);
 
     // Drop all pending stream metadata
@@ -405,109 +422,41 @@ static void VoiceChat_StopAll()
         std::lock_guard<std::mutex> lock(g_streamMx);
         g_streamMap.clear();
     }
-    // Clear queued jobs
-    {
-        std::lock_guard<std::mutex> lock(g_queueMx);
-        g_queue.clear();
-    }
 }
 
-// Speak text (router). Supports destination 1 (immediate) and 4 (queued).
-static void VoiceChat_SpeakText(int voiceID, const std::wstring& text, const std::wstring& destination, int rate, int volume)
+// Speak text: directly hand off to SAPI (no app-side queuing).
+static void VoiceChat_SpeakText(int voiceID, const std::wstring& text, int destination, int rate, int volume)
 {
     const int utteranceID = GetNextUtteranceID();
 
     VoiceChat_InitVoice();
     if (!g_pVoice) {
-        FrameScript::FireEvent(
-            VOICE_CHAT_TTS_PLAYBACK_FAILED,
-            "EngineAllocationFailed",
-            std::to_string(utteranceID).c_str(),
-            WideStringToUtf8(destination).c_str()
-        );
+        FireEvent_TTS_PlaybackFailed("EngineAllocationFailed", utteranceID, ClampDestination(destination));
         return;
     }
 
-    auto destToInt = [](const std::wstring& d) -> int {
-        if (d == L"1" || iequals(d, L"LocalPlayback")) return DEST_LOCAL_PLAYBACK;
-        if (d == L"4" || iequals(d, L"QueuedLocalPlayback")) return DEST_QUEUED_LOCAL_PLAYBACK;
-        return DEST_LOCAL_PLAYBACK; // default
-    };
-    const int dest = destToInt(destination);
+    const int dest = ClampDestination(destination);
 
-    QueuedItem qi{ voiceID, text, destination, rate, volume, utteranceID };
-
-    if (dest == DEST_QUEUED_LOCAL_PLAYBACK)
-    {
-        // If busy, queue and report "Queued"
-        if (VoiceChat_IsBusy()) {
-            {
-                std::lock_guard<std::mutex> lock(g_queueMx);
-                g_queue.push_back(qi);
-            }
-            FrameScript::FireEvent(
-                VOICE_CHAT_TTS_SPEAK_TEXT_UPDATE,
-                "Queued",
-                std::to_string(utteranceID).c_str()
-            );
-            return;
-        }
-        // Otherwise start now (and the rest will follow)
-        ULONG streamNum = 0;
-        if (!VoiceChat_StartSpeakNow(qi, &streamNum)) {
-            FrameScript::FireEvent(
-                VOICE_CHAT_TTS_PLAYBACK_FAILED,
-                "InternalError",
-                std::to_string(utteranceID).c_str(),
-                WideStringToUtf8(destination).c_str()
-            );
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lock(g_streamMx);
-            g_streamMap[streamNum] = UtteranceMeta{ utteranceID, destination };
-        }
-        FrameScript::FireEvent(
-            VOICE_CHAT_TTS_PLAYBACK_STARTED,
-            "1",
-            std::to_string(utteranceID).c_str(),
-            "0",
-            WideStringToUtf8(destination).c_str()
-        );
-        return;
-    }
-
-    // DEST_LOCAL_PLAYBACK (1): speak immediately (no queue)
     ULONG streamNum = 0;
-    if (!VoiceChat_StartSpeakNow(qi, &streamNum)) {
-        FrameScript::FireEvent(
-            VOICE_CHAT_TTS_PLAYBACK_FAILED,
-            "InternalError",
-            std::to_string(utteranceID).c_str(),
-            WideStringToUtf8(destination).c_str()
-        );
+    if (!VoiceChat_StartSpeakNow(voiceID, text, rate, volume, &streamNum)) {
+        FireEvent_TTS_PlaybackFailed("InternalError", utteranceID, dest);
         return;
     }
+
+    // Track stream for START/FINISH events (dest echoed back)
     {
         std::lock_guard<std::mutex> lock(g_streamMx);
-        g_streamMap[streamNum] = UtteranceMeta{ utteranceID, destination };
+        g_streamMap[streamNum] = UtteranceMeta{ utteranceID, dest, /*startedEmitted*/false };
     }
-    FrameScript::FireEvent(
-        VOICE_CHAT_TTS_PLAYBACK_STARTED,
-        "1",
-        std::to_string(utteranceID).c_str(),
-        "0",
-        WideStringToUtf8(destination).c_str()
-    );
 }
 
-// Convenience overload using CVars
+// Convenience overload (CVars), uses destination=1
 void VoiceChat_SpeakText(const std::wstring& text)
 {
     int voiceID = atoi(s_cvar_voiceID->vStr);
     int speed   = atoi(s_cvar_speed->vStr);
     int volume  = atoi(s_cvar_volume->vStr);
-    VoiceChat_SpeakText(voiceID, text, L"1" /*LocalPlayback*/, speed, volume);
+    VoiceChat_SpeakText(voiceID, text, DEST_LOCAL_PLAYBACK, speed, volume);
 }
 
 // ============================================================================
@@ -565,15 +514,10 @@ static int Lua_VoiceChat_SpeakText(lua_State* L)
     int voiceID = (int)luaL_checknumber(L, 1);
     const char* text = luaL_checklstring(L, 2, nullptr);
 
-    // destination: number 1/4 or string ("LocalPlayback"/"QueuedLocalPlayback")
-    std::wstring wDest = L"1"; // default LocalPlayback
+    int dest = DEST_LOCAL_PLAYBACK; // default
     if (lua_gettop(L) >= 3 && lua_type(L, 3) != LUA_TNIL) {
-        if (lua_type(L, 3) == LUA_TNUMBER) {
-            int d = (int)luaL_checknumber(L, 3);
-            wDest = (d == 4) ? L"4" : L"1";
-        } else {
-            wDest = Utf8ToWide(luaL_checklstring(L, 3, nullptr));
-        }
+        dest = (int)luaL_checknumber(L, 3); // only number
+        dest = (dest == DEST_QUEUED_LOCAL_PLAYBACK) ? DEST_QUEUED_LOCAL_PLAYBACK : DEST_LOCAL_PLAYBACK;
     }
 
     int rate = 0;
@@ -585,8 +529,7 @@ static int Lua_VoiceChat_SpeakText(lua_State* L)
         volume = (int)luaL_checknumber(L, 5);
 
     std::wstring wText = Utf8ToWide(text);
-
-    VoiceChat_SpeakText(voiceID, wText, wDest, rate, volume);
+    VoiceChat_SpeakText(voiceID, wText, dest, rate, volume);
     return 0;
 }
 
@@ -636,7 +579,7 @@ static int Lua_TTS_SetDefaultSettings(lua_State* L)
     SetCVarInt(s_cvar_speed,   0);
     SetCVarInt(s_cvar_volume,  100);
 
-    FrameScript::FireEvent(VOICE_CHAT_TTS_VOICES_UPDATE, "");
+    FireEvent_NoArgs(VOICE_CHAT_TTS_VOICES_UPDATE);
     return 0;
 }
 
@@ -666,7 +609,7 @@ static int Lua_TTS_SetVoiceOptionByID(lua_State* L)
     id = std::clamp(id, 0, maxVoice - 1);
     SetCVarInt(s_cvar_voiceID, id);
 
-    FrameScript::FireEvent(VOICE_CHAT_TTS_VOICES_UPDATE, "");
+    FireEvent_NoArgs(VOICE_CHAT_TTS_VOICES_UPDATE);
     return 0;
 }
 
@@ -683,7 +626,7 @@ static int Lua_TTS_SetVoiceOptionByName(lua_State* L)
     }
     if (found >= 0) {
         SetCVarInt(s_cvar_voiceID, found);
-        FrameScript::FireEvent(VOICE_CHAT_TTS_VOICES_UPDATE, "");
+        FireEvent_NoArgs(VOICE_CHAT_TTS_VOICES_UPDATE);
     }
     return 0;
 }
@@ -797,9 +740,8 @@ void VoiceChat::initialize()
     Hooks::FrameXML::registerEvent(VOICE_CHAT_TTS_PLAYBACK_FAILED);
     Hooks::FrameXML::registerEvent(VOICE_CHAT_TTS_PLAYBACK_FINISHED);
     Hooks::FrameXML::registerEvent(VOICE_CHAT_TTS_PLAYBACK_STARTED);
-    Hooks::FrameXML::registerEvent(VOICE_CHAT_TTS_SPEAK_TEXT_UPDATE);
+    Hooks::FrameXML::registerEvent(VOICE_CHAT_TTS_SPEAK_TEXT_UPDATE); // kept for compatibility (unused)
     Hooks::FrameXML::registerEvent(VOICE_CHAT_TTS_VOICES_UPDATE);
 
     VoiceChat_RefreshVoices(); // fill cache and fire VOICES_UPDATE at startup
-    FrameScript::FireEvent(VOICE_CHAT_TTS_VOICES_UPDATE, "");
 }
