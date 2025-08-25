@@ -756,3 +756,17 @@ void VoiceChat::initialize()
 
     VoiceChat_RefreshVoices(); // fill cache and fire VOICES_UPDATE at startup
 }
+
+void VoiceChat::shutdown()
+{
+    if (!g_pVoice) {
+        return;
+    }
+
+    VoiceChat_StopAll();
+
+    if (g_pVoice) {
+        g_pVoice->Release();
+        g_pVoice = nullptr;
+    }
+}

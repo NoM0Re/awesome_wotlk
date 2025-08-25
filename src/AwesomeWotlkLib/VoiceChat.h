@@ -1,5 +1,6 @@
 #pragma once
 
 namespace VoiceChat {
-void initialize();
+    void initialize();
+    void shutdown();
 }
